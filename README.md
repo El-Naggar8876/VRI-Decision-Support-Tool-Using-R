@@ -55,8 +55,10 @@ This tool was developed and tested in the framework of a **precision irrigation 
 ## How to Use
 1- Prepare the Data:
 - Ensure weather and spatial data files are in place and correctly formatted.
+  
 2- Run the Script:
 - Execute the script in an R environment, making sure all required packages are installed.
+  
 3- Analyze Outputs:
 - Review the plots and data outputs to guide irrigation decisions.
 ## Future Improvements
