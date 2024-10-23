@@ -1,0 +1,608 @@
+---
+title: "VRI-DSS"
+author: "Ahmed Elnaggar"
+date: "2023-08-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_knit$set(root.dir = "D:/Documents/my_R_directory")
+
+getwd()
+```
+
+```{r load_lib, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr.duplicate.label = "allow" 
+library(readxl)
+library(sf)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(raster)
+library(gridExtra)
+library(writexl)
+```
+
+
+# Read weather data 
+```{r weather_data}
+
+df_temp <- as.data.frame(readxl::read_xlsx(
+  path = 'D:/IHE Delft 2022-present/HR-barley.xlsx', 
+  sheet = "barley"
+))
+
+str(df_temp)
+summary(df_temp)
+
+
+# convert all character columns to numeric. this only applied if you have character columns
+#df_temp <- df_temp %>% mutate_if(is.character, as.numeric)
+
+#Define the origin date for Excel using one of these two options 
+#origin_date <- as.Date("1970-01-01")
+origin_date_excel <- as.Date("1899-12-30")
+
+# Convert the Date column from Excel's numeric format to R's Date format
+df_temp$Date <- as.Date(df_temp$Date, origin = origin_date_excel)
+
+
+
+# Add a new column to the data frame representing the days after planting (DAP) for each date
+df_temp <- df_temp %>%
+  mutate(DAP = as.numeric(difftime(Date, min(Date), units = "days")) + 1)
+
+# Add a new column to the data frame representing the day of the year for each date. library(lubridate)
+
+df_temp$day_of_year <- yday(df_temp$Date)
+```
+
+# Calculate ETo
+```{r }
+# Add a new column with values equal to 1
+df_temp$DP_correct <- 1
+
+# Define ground elevation above mean sea level in m
+lat <- -39.89
+h_sea_level <- 75
+
+calculate_PMETo <- function(df, lat, h) {
+  # Constants
+  PI <- pi
+  # Convert latitude to radians
+  Lat_conv <- lat * PI / 180
+  # Calculate P
+  P <- 101.3 * ((293 - 0.0065 * h) / 293) ^ 5.26
+  # Calculate gamma
+  gamma <- 0.000665 * P
+  # Calculate estimated dew point
+  Est_Dew_P <- df$Tmin + df$DP_correct
+  # Calculate vapor pressure
+  Vap_P <- 0.6108 * exp(17.27 * Est_Dew_P / (Est_Dew_P + 237.3))
+  # Calculate D
+  D <- 0.409 * sin(2 * PI * df$day_of_year / 365 - 1.39)
+  # Calculate H
+  H <- acos(-tan(Lat_conv) * tan(D))
+  # Calculate N
+  N <- 24 * H / PI
+  # Calculate Ra
+  Ra <- (24 * 60 / PI) * (0.082) * (H * sin(Lat_conv) * sin(D) + cos(Lat_conv) * cos(D) * sin(H)) * (1 + (0.0334) * cos(2 * PI /365 * df$day_of_year))
+  
+Rn <- (1 - 0.23) * df$Rs - ((4.903e-9) *((df$Tmax +273.16)^4 + (df$Tmin +273.16)^4)/2)*(0.34 -0.14*sqrt(Vap_P))*(1.35*df$Rs/((0.25+0.54)*Ra)-0.35)
+
+Tav <- (df$Tmax + df$Tmin)/2
+
+es <- (0.6108*exp(17.27*df$Tmax/(df$Tmax+237.3))+0.6108*exp(17.27*df$Tmin/(df$Tmin+237.3)))/2
+
+delta <-4098*0.6108*exp(17.27*Tav/(Tav+237.3))/(Tav+237.3)^2
+
+ETo<-(0.408*delta*Rn+gamma*900/(Tav+273)*df$u2*(es-Vap_P))/(delta+gamma*(1+0.34*df$u2))
+
+return(list(Est_Dew_P = Est_Dew_P, Vap_P = Vap_P, D = D, H = H, N = N, Ra = Ra, Rn = Rn, Tav = Tav, es = es, delta = delta, ETo = ETo))
+}
+
+
+result_ETo <- calculate_PMETo(df_temp, lat, h_sea_level)
+
+df_temp$Est_Dew_P <- result_ETo$Est_Dew_P
+df_temp$Vap_P <- result_ETo$Vap_P
+df_temp$D <- result_ETo$D
+df_temp$H <- result_ETo$H
+df_temp$N <- result_ETo$N
+df_temp$Ra <- result_ETo$Ra
+df_temp$Rn <- result_ETo$Rn
+df_temp$Tav <- result_ETo$Tav
+df_temp$es <- result_ETo$es
+df_temp$delta <- result_ETo$delta
+df_temp$ETo <- result_ETo$ETo
+
+
+# Reshape the data into long format
+data_long <- reshape2::melt(df_temp, id.vars = "DAP", measure.vars = c("Tav", "Rn", "Vap_P", "ETo"))
+
+# Create a line plot with facets for each variable
+ggplot(data_long, aes(x = DAP, y = value)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y")
+
+
+```
+
+# Calculate crop coefficent (Kcb)
+```{r swb_functions}
+# Define a function to calculate kcb values
+calculate_kcb <- function(df, initial_length, dev_length, mid_length, late_length, initial_value, dev_value, mid_value, late_value) {
+  # Create a new column for kcb values
+  df$kcb <- NA
+  
+  # Calculate the cumulative length of each stage
+  initial_end <- initial_length
+  dev_end <- initial_end + dev_length
+  mid_end <- dev_end + mid_length
+  late_end <- mid_end + late_length
+  
+  # Assign kcb values based on the days after planting
+  df$kcb[df$DAP <= initial_end] <- initial_value
+  df$kcb[df$DAP > initial_end & df$DAP <= dev_end] <- dev_value
+  df$kcb[df$DAP > dev_end & df$DAP <= mid_end] <- mid_value
+  df$kcb[df$DAP > mid_end & df$DAP <= late_end] <- late_value
+  
+  # Return the updated data frame
+  return(df)
+}
+
+# Assuming your data frame is named 'df'
+# Define the length and value of each stage
+initial_length <- 20
+dev_length <- 55
+mid_length <- 65
+late_length <- 29
+
+initial_value <- 0.3
+dev_value <- 1.15
+mid_value <- 0.25
+late_value <- 1
+
+# Calculate kcb values and add them to the data frame
+df_temp <- calculate_kcb(df_temp, initial_length, dev_length, mid_length, late_length, initial_value, dev_value, mid_value, late_value)
+
+
+```
+
+# Crop height
+```{r }
+# Define a function to calculate h_crop  values
+calculate_h_crop <- function(df, initial_length, dev_length, mid_length, late_length, initial_value, dev_value, mid_value, late_value) {
+  # Create a new column for h_crop  values
+  df$h_crop  <- NA
+  
+  # Calculate the cumulative length of each stage
+  initial_end <- initial_length
+  dev_end <- initial_end + dev_length
+  mid_end <- dev_end + mid_length
+  late_end <- mid_end + late_length
+  
+  # Assign h_crop  values based on the days after planting
+  df$h_crop [df$DAP <= initial_end] <- initial_value
+  df$h_crop [df$DAP > initial_end & df$DAP <= dev_end] <- dev_value
+  df$h_crop [df$DAP > dev_end & df$DAP <= mid_end] <- mid_value
+  df$h_crop [df$DAP > mid_end & df$DAP <= late_end] <- late_value
+  
+  # Return the updated data frame
+  return(df)
+}
+
+# Assuming your data frame is named 'df'
+# Define the length and value of each stage
+initial_length <- 20
+dev_length <- 55
+mid_length <- 65
+late_length <- 29
+
+initial_value <- 0
+dev_value <- 0.10
+mid_value <- 0.55
+late_value <- 0.45
+
+# Calculate kcb values and add them to the data frame
+df_temp <- calculate_h_crop(df_temp, initial_length, dev_length, mid_length, late_length, initial_value, dev_value, mid_value, late_value)
+
+```
+
+
+# Calculate fc
+```{r }
+
+calculate_fc <- function(df, kcb, h) {
+  # Constants
+  Rhmin <- df$Vap_P / (0.6108 * exp(17.27 * df$Tmax / (df$Tmax + 237.3))) * 100
+ 
+   # Convert latitude to radians
+  kcb_corr <- df$kcb + (0.04 * (df$u2-2) - 0.004 * (Rhmin-45)) * (df$h/3)^0.3
+  
+  # Calculate P
+  kc_max <- max(1.2 + (0.04 * (df$u2 - 2) - 0.004 * (Rhmin - 45)) * (df$h / 3) ^ 0.3, kcb_corr + 0.05)
+  
+  # Calculate gamma
+  fc <- ((kcb_corr  - 0.15) / (kc_max - 0.15)) ^ (1 + 0.5 * df$h)
+  
+  return(list(Rhmin = Rhmin, kcb_corr = kcb_corr, kc_max = kc_max, fc = fc))
+}
+
+result_fc <- calculate_fc(df_temp, df_temp$kcb, df_temp$h_crop)
+
+df_temp$Rhmin <- result_fc$Rhmin
+df_temp$kcb_corr <- result_fc$kcb_corr
+df_temp$kc_max <- result_fc$kc_max
+df_temp$fc <- result_fc$fc
+
+```
+
+# Read spatial data for soil 
+```{r }
+# read shapefile for soil zones
+shp <- st_read("D:/IHE Delft 2022-present/WebApp/barley-hr-4soils2.shp")
+
+#convert shapefile into raster and tune the resolution into 5mx5m 
+ras_resampled <- raster(extent(shp), res=10)# Create an empty raster with the same extent and resolution as the shapefile
+
+# Rasterize the shapefile
+ras <- rasterize(shp, ras_resampled)
+
+# extract coordinates
+coords <- coordinates(ras)
+coords <- as.data.frame(ras, xy = TRUE)
+
+# remove all na values
+#coords$layer_drainage<- NULL # this applied only if you have a column with all na value
+df_spat <- na.omit(coords)
+
+str(df_spat)
+
+# Convert specific columns to numeric. this applied if your TEW, REW, p and TAW arent numeric
+df_spat <- df_spat %>% mutate_at(vars(layer_TEW, layer_p, layer_REW), as.numeric)
+
+str(df_spat)
+
+#df_spat
+
+```
+
+# Calculate soil-water-balance components ("Dr", "Dri", "DP" and "IRR") columns
+
+```{r }
+calculate_Dri <- function(df_temp, REW, TEW, p, TAW, TAW_max,TAW_min, trigger_values, trigger_dap_values) {
+  # Initialize variables
+  n <- nrow(df_temp)
+  De <- numeric(n)
+  DPe <- numeric(n)
+  kr <- numeric(n)
+  ke <- numeric(n)
+  E <- numeric(n)
+  Dei <- numeric(n)
+  kc <- numeric(n)
+  Dr <- numeric(n)
+  ks <- numeric(n)
+  ETc <- numeric(n)
+  DP <- numeric(n)
+  IRR <-numeric(n)
+  Dri <- numeric(n)
+
+  # Set first value of De
+  # Set first value of De
+  De[1] <- 0
+  Dr[1] <- 0
+  # Interpolate the trigger values based on DAP
+IRR_trigger <- rep(NA, n)
+
+for (i in 1:(length(trigger_dap_values) - 1)) {
+    start_dap <- trigger_dap_values[i]
+    end_dap <- trigger_dap_values[i + 1]
+    
+    start_trigger <- trigger_values[i]
+    end_trigger <- trigger_values[i + 1]
+    
+    interpolated_values <- seq(start_trigger, end_trigger, length.out = end_dap - start_dap + 1)
+    IRR_trigger[start_dap:end_dap] <- interpolated_values
+}
+
+# Fill in the last trigger value for the remaining days
+IRR_trigger[trigger_dap_values[length(trigger_dap_values)]:nrow(df_temp)] <- trigger_values[length(trigger_values)]
+
+
+  # Calculate values for each row of df
+  for (i in seq_len(n)) {
+    DPe[i] <- ifelse(df_temp$P[i] - De[i] < 0, 0, df_temp$P[i] - De[i])
+    kr[i] <- ifelse(De[i] > REW, (TEW - De[i]) / (TEW - REW), 1)
+    ke[i] <- min(kr[i] * (df_temp$kc_max[i] - df_temp$kcb_corr[i]), (1 - df_temp$fc[i]) * df_temp$kc_max[i])
+    E[i] <- df_temp$ETo[i] * ke[i]
+    Dei[i] <- ifelse(De[i] - df_temp$P[i] + DPe[i] + E[i] > TEW, TEW, De[i] - df_temp$P[i] + DPe[i] + E[i])
+    if (i < n) {
+      De[i+1] <- Dei[i]
+    }
+    
+    kc[i] <- df_temp$kcb_corr[i] + ke[i]
+    
+    ks[i] <- if (TAW == TAW_max) {
+    if (Dr[i] > p * TAW) {
+        (TAW - Dr[i]) / ((1 - p) * TAW)
+    } else {
+        1
+    }
+} else if (TAW > TAW_min & TAW < TAW_max) {
+    if (Dr[i] < p * TAW) {
+        (TAW - Dr[i]) / ((1 - p) * TAW) + ((TAW + TAW_min) / (TAW - TAW_min))  / 1000
+    } else {
+        1 + ((TAW + TAW_min) / (TAW - TAW_min))  / 1000
+    }
+} else {
+    if (Dr[i] < p * TAW) {
+        (TAW - Dr[i]) / ((1 - p) * TAW) + 0.2
+    } else {
+        1 + 0.2
+    }
+}
+    
+
+    ETc[i] <- (ks[i] * df_temp$kcb_corr[i] + ke[i]) * df_temp$ETo[i]
+    
+    DP[i] <- ifelse(df_temp$P[i] + IRR[i] - ETc[i] - Dr[i] < 0, 0, df_temp$P[i] + IRR[i] - ETc[i] - Dr[i])
+   
+    # Define your irrigation scheduling application
+    #IRR[i] <- if (Dr[i] <= df_temp$IRR_trigger[i]) {
+     #      IRR[i] <- 0
+      #    } else if (Dr[i] < 20) {
+       #    IRR[i] <- Dr[i]
+       # } else {
+        # IRR[i] <- 20
+      #  }
+    IRR[i] <- ifelse(Dr[i] <= IRR_trigger[i],0,Dr[i])
+    
+    
+    Dri[i] <- Dr[i] - df_temp$P[i] - IRR[i] + ETc[i] + DP[i]
+      if (i < n) {
+      Dr[i+1] <- Dri[i]
+    }
+  }
+
+  return(list(De = De, DPe = DPe, kr = kr, ke = ke, E = E, Dei = Dei, kc = kc, Dr = Dr, ks = ks, ETc = ETc, DP = DP, IRR = IRR, Dri = Dri))
+}
+
+
+
+```
+
+# Create spatio-temporal model 
+```{r }
+calculate_spatiotemporal <- function(df_temp, df_spat) {
+  # Initialize variables
+  n <- nrow(df_spat)
+  spatiotemporal_df <- data.frame()
+
+  # Loop over rows of df_spat
+  for (i in seq_len(n)) {
+    REW <- df_spat$layer_REW[i]
+    TEW <- df_spat$layer_TEW[i]
+    p <- df_spat$layer_p[i]
+    TAW <- df_spat$layer_TAW[i]
+    TAW_max <- max(df_spat$layer_TAW)
+    TAW_min <- min(df_spat$layer_TAW)
+    
+    # Define the trigger values and their corresponding DAP values based on TAW
+    if (TAW == 90) {
+      trigger_values <- c(10, 27, 27, 33) 
+      trigger_dap_values <- c(1, 75, 140, 169)
+    } else if (TAW == 200) {
+      trigger_values <- c(20, 37, 37, 43) 
+      trigger_dap_values <- c(1, 75, 140, 169)
+    } else {
+      trigger_values <- c(30, 47, 47, 53) 
+      trigger_dap_values <- c(1, 75, 140, 169)
+    }
+    
+    
+    temp_output <- calculate_Dri(df_temp, REW, TEW, p, TAW, TAW_max, TAW_min, trigger_values, trigger_dap_values)
+    temp_df <- data.frame(x = df_spat$x[i], y = df_spat$y[i], soil = df_spat$layer_soil[i], DAP = df_temp$DAP, P = df_temp$P, DP = df_temp$DP, temp_output)
+    spatiotemporal_df <- bind_rows(spatiotemporal_df, temp_df)
+  }
+
+  return(spatiotemporal_df)
+}
+
+spatiotemporal_df <- calculate_spatiotemporal(df_temp, df_spat)
+
+# Bind the output column to the data frame as separate columns
+spatiotemporal_df <- bind_cols(spatiotemporal_df, spatiotemporal_df$output[[1]])
+
+# Remove the original output column
+spatiotemporal_df$output <- NULL
+
+# Write the data frame to a CSV file
+#write.csv(spatiotemporal_df, file = "D:/IHE Delft 2022-present/spatiotemporal_df3.csv", row.names = FALSE)
+
+```
+
+
+# PI Prescription Map  
+
+```{r }
+
+DAP_data <- spatiotemporal_df %>%
+  filter(IRR != 0)
+
+
+# Create a data frame with one row for each soil type
+soil_labels <- DAP_data %>%
+  group_by(soil) %>%
+  summarize(x = mean(x), y = mean(y), IRR = mean(IRR))
+
+# Create a map of the IRR variable with soil type labels
+pl2 <- ggplot(DAP_data, aes(x = x, y = y, fill = IRR)) +
+  geom_raster() +
+  scale_fill_gradient(low = "gray", high = "brown") +
+  coord_fixed() +
+  facet_wrap(~ DAP)# +
+  #geom_text(data = soil_labels, aes(x = x, y = y, label = soil), size = 3) # Add text labels for soil type
+pl2
+
+```
+
+# Soil Water Deficit Map
+
+```{r }
+
+DAP_data <- spatiotemporal_df %>%
+  filter(DAP %% 10 == 0) # Filter rows where DAP is a multiple of 10
+
+# Create a data frame with one row for each soil type
+# Create a data frame with one row for each soil type
+soil_labels <- DAP_data %>%
+  group_by(soil) %>%
+  summarize(x = mean(x), y = mean(y), Dri = mean(Dri))
+
+
+# Create a map of the Dri variable with soil type labels
+pl2 <- ggplot(DAP_data, aes(x = x, y = y, fill = Dri)) +
+  geom_raster() +
+  scale_fill_gradient(low = "gray", high = "brown") +
+  coord_fixed() +
+  facet_wrap(~ DAP) #+
+  #geom_text(data = soil_labels, aes(x = x, y = y, label = soil), size = 3) # Add text labels for soil type
+pl2
+
+```
+
+# Temporal Soil Water Deficit and Irrigation 
+
+```{r }
+
+pl3 <- ggplot(spatiotemporal_df, aes(x = DAP, y = Dri, color = soil)) +
+  geom_line() +
+  xlab("DAP") +
+  ylab("Dri")+
+  scale_y_reverse()
+
+# Plot IRR and P side by side
+pl4 <- ggplot(spatiotemporal_df, aes(x = DAP, fill = soil)) +
+  geom_col(aes(y = IRR), position = "dodge") +
+  #geom_col(aes(y = P), position = "dodge") +
+  xlab("DAP") +
+  ylab("IRR")
+
+
+grid.arrange(pl3, pl4, ncol = 1)
+
+```
+
+# Crop Water Use and Irrigation 
+
+```{r }
+
+pl_etc <- ggplot(spatiotemporal_df, aes(x = DAP, y = ETc, color = soil)) +
+  geom_line() +
+  xlab("DAP") +
+  ylab("ETc")
+
+# Plot IRR and P side by side
+pl4 <- ggplot(spatiotemporal_df, aes(x = DAP, fill = soil)) +
+  geom_col(aes(y = IRR), position = "dodge") +
+  #geom_col(aes(y = P), position = "dodge") +
+  xlab("DAP") +
+  ylab("IRR")
+
+
+grid.arrange(pl_etc, pl4, ncol = 1)
+
+```
+
+# Total Irrigation 
+
+```{r }
+
+# Select one cell for each soil type
+selected_cells <- spatiotemporal_df %>%
+  group_by(soil) %>%
+  slice_sample(n = 1) %>%
+  ungroup()
+
+# Get all data related to the selected cell for each soil type
+selected_cells_data <- spatiotemporal_df %>%
+  semi_join(selected_cells, by = c("soil", "x", "y"))
+
+# Calculate the total IRR and DP for each selected cell
+soil_summary <- selected_cells_data %>%
+  group_by(soil) %>%
+  summarize(total_IRR = sum(IRR), total_DP = sum(DP)) %>%
+  ungroup()
+
+# Plot the total IRR for each soil type
+ggplot(soil_summary, aes(x = soil, y = total_IRR)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.0f", total_IRR)), vjust = -0.5) +
+  labs(x = "Soil Type", y = "Total IRR") +
+  theme_minimal()
+```
+
+# Soil Drainage 
+
+```{r }
+
+# Plot the total DP for each soil type
+#ggplot(soil_summary, aes(x = soil, y = total_DP)) +
+#  geom_col() +
+#  geom_text(aes(label = sprintf("%.0f", total_DP)), vjust = -0.5) +
+#  labs(x = "Soil Type", y = "Total DP") +
+#  theme_minimal()
+
+```
+
+# Water Use Efficiency 
+```{r }
+
+# Calculate the water saving for each soil type
+df <- soil_summary %>%
+  mutate(water_saving = (max(total_IRR) - total_IRR) / max(total_IRR))
+
+# Plot the water saving for each soil type
+ggplot(df, aes(x = soil, y = water_saving)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.2f", water_saving)), vjust = -0.5) +
+  labs(x = "Soil Type", y = "Water Saving (%)")
+```
+
+```{r }
+
+# Save the pl2 plot to a PNG file
+#ggsave("D:/Documents/my_R_directory/VRI-spatio-temporal-rmd-ff/pl2.png", plot = pl2)
+
+# Save the pl3 plot to a PNG file
+#ggsave("D:/Documents/my_R_directory/VRI-spatio-temporal-rmd-ff/pl3.png", plot = pl3)
+
+# Save the pl4 plot to a PNG file
+#ggsave("D:/Documents/my_R_directory/VRI-spatio-temporal-rmd-ff/pl4.png", plot = pl4)
+
+```
+
+```{r , echo=FALSE}
+# Install the conflicted package
+#install.packages("conflicted")
+
+# Load the conflicted package
+#library(conflicted)
+
+# Specify that the select function from the dplyr package should be used
+#conflict_prefer("select", "dplyr")
+#conflict_prefer("filter", "dplyr")
+##########################################################
+# Create a map of the IRR variable
+#pl2 <- ggplot(DAP_data, aes(x = x, y = y, fill = IRR)) +
+ # geom_raster() +
+  #scale_fill_gradient(low = "gray", high = "brown") +
+  #coord_fixed() +
+  #facet_wrap(~ DAP)
+#pl2
+
+```
