@@ -1,7 +1,9 @@
 # VRI-Decision-Support-Tool-Using-R
 
 ## Overview
-The VRI-DSS (Variable Rate Irrigation Decision Support System) script, created by Ahmed Elnaggar on 2023-08-23, performs advanced agronomic and hydrological computations to estimate weather data, reference evapotranspiration (ETo), crop coefficients (Kcb), and soil-water balance. The script integrates spatial data, including soil types, to optimize irrigation decisions and provide insights into water use efficiency for different soil zones.
+The **VRI-DSS** (Variable Rate Irrigation Decision Support Tool) script, created by **Ahmed Elnaggar** on **August 23, 2023**, performs advanced agronomic and hydrological computations to estimate weather data, reference evapotranspiration (ETo), crop coefficients (Kcb), and soil-water balance. The script integrates spatial data, including soil types, to optimize irrigation decisions and provide insights into water use efficiency for different soil zones.
+
+This tool was developed and tested in the framework of a **precision irrigation study**. For more details, you can refer to the published study [here](https://acsess.onlinelibrary.wiley.com/doi/epdf/10.1002/agj2.21331).
 
 ## Requirements
 ### R Packages:
